@@ -1,0 +1,460 @@
+// Package status computes the ladders of a node (spec 04.8): H for the human proof, L for Lean, I for each language, V for the visualization and W for the writing.
+//
+// Nobody writes a level by hand. Each level comes with the reasons that it is not higher, so that a page can say what it needs next.
+package status
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strings"
+
+	"go.yaml.in/yaml/v3"
+
+	"github.com/tamnd/algorithm-agent/node"
+)
+
+// Rung is the level of one ladder, with the reasons that it is not higher.
+type Rung struct {
+	Level int      `json:"level"`
+	Max   int      `json:"max"`
+	Label string   `json:"label"` // for example "H2"
+	Name  string   `json:"name"`  // for example "full proof"
+	Next  []string `json:"next,omitempty"`
+}
+
+// Status is the set of ladders of one node.
+type Status struct {
+	Slug  string          `json:"slug"`
+	H     Rung            `json:"h"`
+	L     Rung            `json:"l"`
+	I     map[string]Rung `json:"i"`
+	V     Rung            `json:"v"`
+	W     Rung            `json:"w"`
+	Tests map[string]Test `json:"tests,omitempty"`
+}
+
+// Test is the result of the native tests of one implementation, as `algo test` writes it.
+type Test struct {
+	Slug   string `json:"slug"`
+	Lang   string `json:"lang"`
+	Pass   bool   `json:"pass"`
+	Output string `json:"output,omitempty"`
+	Ms     int64  `json:"ms"`
+}
+
+// Results is the content of one file build/results/<lang>.json.
+type Results struct {
+	Lang    string `json:"lang"`
+	Version string `json:"version,omitempty"`
+	Tests   []Test `json:"tests"`
+}
+
+// Review is a review record, reviews/<tag>/<part>.yaml (spec 13.2).
+type Review struct {
+	Part     string `yaml:"part"`
+	Hash     string `yaml:"hash"`
+	Reviewer string `yaml:"reviewer"`
+	Date     string `yaml:"date"`
+	Verdict  string `yaml:"verdict"`
+}
+
+// Env is what the ladders read besides the node.
+type Env struct {
+	Corpus  *node.Corpus
+	Results map[string]map[string]Test // slug, then lang
+	// VizChecked holds the scenes that passed `algo viz check` in this build, by slug, with the failures of the others.
+	VizChecked map[string][]string
+}
+
+// LoadResults reads every build/results/*.json under dir. A missing dir gives no results.
+func LoadResults(dir string) (map[string]map[string]Test, error) {
+	out := map[string]map[string]Test{}
+	files, err := filepath.Glob(filepath.Join(dir, "*.json"))
+	if err != nil {
+		return nil, err
+	}
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			return nil, err
+		}
+		var r Results
+		if err := json.Unmarshal(b, &r); err != nil {
+			return nil, fmt.Errorf("%s: %w", f, err)
+		}
+		for _, t := range r.Tests {
+			if out[t.Slug] == nil {
+				out[t.Slug] = map[string]Test{}
+			}
+			out[t.Slug][t.Lang] = t
+		}
+	}
+	return out, nil
+}
+
+// Hash is the hash that a review binds to: sha256 of the file, in hex.
+func Hash(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	s := sha256.Sum256(b)
+	return hex.EncodeToString(s[:]), nil
+}
+
+// reviewed tells if reviews/<tag>/<part>.yaml exists, approves, and binds to the current hash of file.
+func reviewed(root, tag, part, file string) (bool, string) {
+	if tag == "" {
+		return false, "the node has no tag yet"
+	}
+	b, err := os.ReadFile(filepath.Join(root, "reviews", tag, part+".yaml"))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, "no review record reviews/" + tag + "/" + part + ".yaml"
+	}
+	if err != nil {
+		return false, err.Error()
+	}
+	var r Review
+	if err := yaml.Unmarshal(b, &r); err != nil {
+		return false, "the review record does not parse"
+	}
+	h, err := Hash(file)
+	if err != nil {
+		return false, err.Error()
+	}
+	if r.Hash != h {
+		return false, "the review is for an older version of the file"
+	}
+	if r.Verdict != "" && r.Verdict != "approve" {
+		return false, "the review does not approve"
+	}
+	return true, ""
+}
+
+// Of computes the ladders of n.
+func Of(n *node.Node, env Env) Status {
+	s := Status{Slug: n.Slug, I: map[string]Rung{}, Tests: map[string]Test{}}
+	s.H = human(n, env)
+	s.L = lean(n, env)
+	for _, im := range n.Impls {
+		s.I[im.Lang] = impl(n, im, env)
+		if t, ok := env.Results[n.Slug][im.Lang]; ok {
+			s.Tests[im.Lang] = t
+		}
+	}
+	s.V = visual(n, env)
+	s.W = Writing(n, env)
+	return s
+}
+
+var hNames = []string{"no proof", "sketch", "full proof", "reviewed proof"}
+
+func human(n *node.Node, env Env) Rung {
+	r := Rung{Max: 3}
+	defer func() { r.Label, r.Name = fmt.Sprintf("H%d", r.Level), hNames[r.Level] }()
+	if len(n.Proofs) == 0 {
+		r.Next = []string{"add a proof in proofs/ (06.5)"}
+		return r
+	}
+	r.Level = 1
+	proves := map[string]bool{}
+	var full []node.Proof
+	for _, p := range n.Proofs {
+		if p.Front.Status != "full" {
+			continue
+		}
+		full = append(full, p)
+		for _, c := range p.Front.Proves {
+			proves[c] = true
+		}
+	}
+	var need []string
+	if !proves["correctness"] {
+		need = append(need, "a full proof of correctness")
+	}
+	for _, c := range claims(n) {
+		if !proves[c] && !proves["complexity"] {
+			need = append(need, "a full proof of "+c)
+		}
+	}
+	if len(need) > 0 {
+		r.Next = need
+		return r
+	}
+	r.Level = 2
+	root := env.Corpus.Root
+	for _, p := range full {
+		if ok, why := reviewed(root, n.Tag, "proof-"+p.ID, filepath.Join(root, p.Path)); !ok {
+			r.Next = append(r.Next, p.ID+": "+why)
+		}
+	}
+	if len(r.Next) == 0 {
+		r.Level = 3
+	}
+	return r
+}
+
+// claims lists the complexity claims of the front matter as "time.worst", "space.extra" and so on.
+func claims(n *node.Node) []string {
+	c := n.Complexity
+	if c == nil {
+		return nil
+	}
+	var out []string
+	add := func(group string, m map[string]string) {
+		for _, k := range sortedKeys(m) {
+			out = append(out, group+"."+k)
+		}
+	}
+	add("time", c.Time)
+	add("space", c.Space)
+	for _, g := range sortedKeys(c.Other) {
+		add(g, c.Other[g])
+	}
+	return out
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	slices.Sort(ks)
+	return ks
+}
+
+var lNames = []string{"no Lean part", "spec and model", "correctness proved", "cost proved", "refinement proved"}
+
+func lean(n *node.Node, env Env) Rung {
+	r := Rung{Max: 4}
+	defer func() { r.Label, r.Name = fmt.Sprintf("L%d", r.Level), lNames[r.Level] }()
+	mod := n.Lean["module"]
+	if mod == "" {
+		r.Next = []string{"name a Lean module in the lean field (07)"}
+		return r
+	}
+	file := filepath.Join(env.Corpus.Root, "lean", filepath.FromSlash(strings.ReplaceAll(mod, ".", "/"))+".lean")
+	if _, err := os.Stat(file); err != nil {
+		r.Next = []string{"the module " + mod + " does not exist"}
+		return r
+	}
+	if ok, why := reviewed(env.Corpus.Root, n.Tag, "lean-spec", file); !ok {
+		r.Next = []string{"a fidelity review of the spec: " + why}
+		return r
+	}
+	r.Level = 1
+	r.Next = []string{"L2 needs `algo lean build` and the axiom report, which are M0 work"}
+	return r
+}
+
+var iNames = []string{"not checked yet", "shared cases pass", "differential and mutation", "clean and measured", "reviewed"}
+
+func impl(n *node.Node, im node.Impl, env Env) Rung {
+	r := Rung{Max: 4}
+	defer func() { r.Label, r.Name = fmt.Sprintf("I%d", r.Level), iNames[r.Level] }()
+	t, ran := env.Results[n.Slug][im.Lang]
+	switch {
+	case !im.HasTests():
+		r.Next = append(r.Next, "add native tests (09.9)")
+	case !ran:
+		r.Next = append(r.Next, "the native tests did not run in this build")
+	case !t.Pass:
+		r.Next = append(r.Next, "the native tests fail")
+	}
+	r.Next = append(r.Next, "I1 needs the shared cases of the contract and the JSON adapter (09.2), which are M0 work")
+	return r
+}
+
+var vNames = []string{"none", "static frames", "interactive and checked", "reviewed"}
+
+func visual(n *node.Node, env Env) Rung {
+	r := Rung{Max: 3}
+	defer func() { r.Label, r.Name = fmt.Sprintf("V%d", r.Level), vNames[r.Level] }()
+	figs, _ := filepath.Glob(filepath.Join(n.Dir, "figures", "*.svg"))
+	if n.Scene == "" && len(figs) == 0 {
+		r.Next = []string{"add viz/scene.ts or a figure (10)"}
+		return r
+	}
+	if n.Scene == "" {
+		r.Level = 1
+		r.Next = []string{"add an interactive scene in viz/scene.ts"}
+		return r
+	}
+	fails, checked := env.VizChecked[n.Slug]
+	if !checked {
+		r.Next = []string{"the scene was not checked in this build"}
+		return r
+	}
+	if len(fails) > 0 {
+		r.Next = fails
+		return r
+	}
+	r.Level = 1
+	r.Next = []string{"V2 needs the oracle check V03, line-trace agreement V06, the counter check V07 and the budgets V08 (10.8.2)"}
+	return r
+}
+
+var wNames = []string{"stub", "outline", "basic", "standard", "complete", "reviewed"}
+
+// Sections returns the level 2 headings of the body, in order.
+func Sections(body string) []string {
+	var out []string
+	fence := false
+	for _, l := range strings.Split(body, "\n") {
+		if strings.HasPrefix(l, "```") || strings.HasPrefix(l, "~~~") {
+			fence = !fence
+			continue
+		}
+		if !fence && strings.HasPrefix(l, "## ") {
+			out = append(out, strings.TrimSpace(l[3:]))
+		}
+	}
+	return out
+}
+
+// Section returns the text of the level 2 section with the heading h, without the heading.
+func Section(body, h string) string {
+	var b strings.Builder
+	in, fence := false, false
+	for _, l := range strings.Split(body, "\n") {
+		if strings.HasPrefix(l, "```") || strings.HasPrefix(l, "~~~") {
+			fence = !fence
+		}
+		if !fence && strings.HasPrefix(l, "## ") {
+			in = strings.TrimSpace(l[3:]) == h
+			continue
+		}
+		if in {
+			b.WriteString(l)
+			b.WriteByte('\n')
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// Lead returns the text before the first heading.
+func Lead(body string) string {
+	i := strings.Index(body, "\n## ")
+	if strings.HasPrefix(body, "## ") {
+		return ""
+	}
+	if i < 0 {
+		return strings.TrimSpace(body)
+	}
+	return strings.TrimSpace(body[:i])
+}
+
+var listItem = regexp.MustCompile(`(?m)^\s*(?:[-*]|\d+\.)\s+\S`)
+
+// need is one requirement of a writing level.
+type need struct {
+	what string
+	ok   func() bool
+}
+
+// Writing computes the W ladder from the sections, their content and the links (spec 06.8).
+func Writing(n *node.Node, env Env) Rung {
+	r := Rung{Max: 5}
+	defer func() { r.Label, r.Name = fmt.Sprintf("W%d", r.Level), wNames[r.Level] }()
+	has := func(h string) func() bool {
+		return func() bool { return Section(n.Body, h) != "" }
+	}
+	sources := func(k int) func() bool { return func() bool { return len(n.Sources) >= k } }
+	located := func() bool {
+		for _, s := range n.Sources {
+			if s.Locator != "" {
+				return true
+			}
+		}
+		return false
+	}
+	items := func(h string, k int) func() bool {
+		return func() bool { return len(listItem.FindAllString(Section(n.Body, h), -1)) >= k }
+	}
+	linked := func() bool {
+		for _, p := range n.Prereqs {
+			if _, ok := env.Corpus.BySlug[p]; !ok {
+				return false
+			}
+		}
+		return true
+	}
+	lead := func() bool { return Lead(n.Body) != "" }
+	pseudo := func() bool { return strings.Contains(n.Body, "```pseudo") }
+	claimsOK := func() bool { return n.Complexity != nil && len(n.Complexity.Time) > 0 }
+	proofAny := func() bool { return len(n.Proofs) > 0 }
+	presets := func() bool { return len(n.Presets) > 0 }
+	exercises := func() bool { return n.Level == "advanced" || n.Level == "research" || len(n.Exercises) > 0 }
+
+	var levels [5][]need
+	levels[0] = []need{{"a name", func() bool { return n.Name != "" }}, {"a summary", func() bool { return n.Summary != "" }}}
+	switch n.Kind {
+	case "algorithm":
+		levels[1] = []need{{"the lead paragraph", lead}, {"the section The problem", has("The problem")}, {"pseudocode in The algorithm", pseudo}, {"complexity claims in the front matter", claimsOK}, {"one source with a locator", located}}
+		levels[2] = []need{{"In plain words", has("In plain words")}, {"Example", has("Example")}, {"Correctness with at least a sketch", func() bool { return has("Correctness")() && proofAny() }}, {"Complexity", has("Complexity")}, {"Properties", has("Properties")}}
+		levels[3] = []need{{"Pitfalls with at least two items", items("Pitfalls", 2)}, {"History with a source", func() bool { return has("History")() && n.History != nil }}, {"at least three sources", sources(3)}, {"every prerequisite exists", linked}, {"a scene preset for the example", presets}}
+		levels[4] = []need{{"Variants and improvements", has("Variants and improvements")}, {"When to use it", has("When to use it")}, {"an exercise", exercises}}
+	case "data-structure":
+		levels[1] = []need{{"the lead paragraph", lead}, {"The abstract type", has("The abstract type")}, {"one source with a locator", located}}
+		levels[2] = []need{{"Representation", has("Representation")}, {"Operations", has("Operations")}, {"Correctness", has("Correctness")}}
+		levels[3] = []need{{"Complexity", has("Complexity")}, {"Pitfalls with at least two items", items("Pitfalls", 2)}, {"at least three sources", sources(3)}, {"every prerequisite exists", linked}}
+		levels[4] = []need{{"Variants", has("Variants")}, {"When to use it", has("When to use it")}}
+	case "problem":
+		levels[1] = []need{{"the lead paragraph", lead}, {"Definition", has("Definition")}, {"one source with a locator", located}}
+		levels[2] = []need{{"Examples", has("Examples")}, {"In plain words", has("In plain words")}}
+		levels[3] = []need{{"Bounds", has("Bounds")}, {"a known algorithm", func() bool { return len(env.Corpus.Solvers(n.Slug)) > 0 }}, {"a contract.yaml", func() bool { _, err := os.Stat(filepath.Join(n.Dir, "contract.yaml")); return err == nil }}}
+		levels[4] = []need{{"Reductions", has("Reductions")}, {"Applications", has("Applications")}}
+	case "technique":
+		levels[1] = []need{{"the lead paragraph", lead}, {"one source with a locator", located}}
+		levels[2] = []need{{"When it applies", has("When it applies")}, {"The template", has("The template")}}
+		levels[3] = []need{{"three classic examples", items("Classic examples", 3)}}
+		levels[4] = []need{{"Variations", has("Variations")}, {"Pitfalls", has("Pitfalls")}, {"five exercises", func() bool { return len(n.Exercises) >= 5 }}}
+	case "theorem":
+		levels[1] = []need{{"the lead paragraph", lead}, {"Statement", has("Statement")}, {"one source with a locator", located}}
+		levels[2] = []need{{"Proof", func() bool { return has("Proof")() || proofAny() }}}
+		levels[3] = []need{{"In plain words", has("In plain words")}, {"Tightness", has("Tightness")}}
+		levels[4] = []need{{"Consequences", has("Consequences")}, {"History", has("History")}}
+	default: // concept, definition, model, abstract type and the others
+		main := map[string]string{"concept": "The idea", "definition": "Definition", "model": "The machine", "abstract-type": "Operations"}[n.Kind]
+		levels[1] = []need{{"the lead paragraph", lead}, {"one source with a locator", located}}
+		if main != "" {
+			levels[2] = []need{{main, has(main)}}
+		}
+		levels[3] = []need{{"examples", func() bool {
+			return has("Examples")() || has("Examples and non-examples")() || has("Laws")() || has("What it counts")()
+		}}, {"every prerequisite exists", linked}}
+		levels[4] = []need{{"at least two sources", sources(2)}}
+	}
+	for lv := range 5 {
+		var miss []string
+		for _, nd := range levels[lv] {
+			if !nd.ok() {
+				miss = append(miss, nd.what)
+			}
+		}
+		if len(miss) > 0 {
+			if lv == 0 {
+				r.Level = 0
+			} else {
+				r.Level = lv - 1
+			}
+			r.Next = miss
+			return r
+		}
+	}
+	file := filepath.Join(n.Dir, "node.md")
+	if ok, why := reviewed(env.Corpus.Root, n.Tag, "text", file); !ok {
+		r.Level = 4
+		r.Next = []string{"a review of the text: " + why}
+		return r
+	}
+	r.Level = 5
+	return r
+}

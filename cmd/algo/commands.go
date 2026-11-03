@@ -1,0 +1,773 @@
+package main
+
+import (
+	"bytes"
+	"errors"
+	"flag"
+	"fmt"
+	"io/fs"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/tamnd/algorithm-agent/check"
+	"github.com/tamnd/algorithm-agent/lang"
+	"github.com/tamnd/algorithm-agent/node"
+	"github.com/tamnd/algorithm-agent/site"
+	"github.com/tamnd/algorithm-agent/status"
+	"github.com/tamnd/algorithm-agent/viz"
+)
+
+func newFlags(name, args string) *flag.FlagSet {
+	fs := flag.NewFlagSet("algo "+name, flag.ContinueOnError)
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "Usage: algo %s %s\n\nFlags:\n", name, args)
+		fs.PrintDefaults()
+	}
+	return fs
+}
+
+func isBool(fl *flag.Flag) bool {
+	b, ok := fl.Value.(interface{ IsBoolFlag() bool })
+	return ok && b.IsBoolFlag()
+}
+
+// parse parses the flags. A bad flag is a usage error. The flag package has already printed the error and the usage, so the error has no text.
+//
+// Flags can come before or after the other arguments, so "algo new heap-sort -area sorting" works. After "--", each argument is a plain argument.
+func parse(f *flag.FlagSet, args []string) error {
+	var flags, rest []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			rest = append(rest, args[i+1:]...)
+			break
+		}
+		if len(a) < 2 || a[0] != '-' {
+			rest = append(rest, a)
+			continue
+		}
+		flags = append(flags, a)
+		name := strings.TrimLeft(a, "-")
+		if strings.Contains(name, "=") {
+			continue
+		}
+		if fl := f.Lookup(name); fl != nil && !isBool(fl) && i+1 < len(args) {
+			flags = append(flags, args[i+1])
+			i++
+		}
+	}
+	err := f.Parse(append(append(flags, "--"), rest...))
+	if err == nil || errors.Is(err, flag.ErrHelp) {
+		return err
+	}
+	return usageError{}
+}
+
+func load(root string) (*node.Corpus, error) {
+	if _, err := os.Stat(filepath.Join(root, "nodes")); err != nil {
+		return nil, fmt.Errorf("%s has no nodes directory; run algo in a clone of tamnd/algorithm or use -root", root)
+	}
+	return node.Load(root)
+}
+
+var slugRE = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+
+// cmdNew makes nodes/<area>/<slug>/node.md with the sections of the kind (spec 06.3).
+func cmdNew(args []string) error {
+	f := newFlags("new", "-area <top/sub> [-name <name>] [<kind>] <slug>")
+	root := f.String("root", ".", "the root of the content repository")
+	kind := f.String("kind", "algorithm", "the kind of the node")
+	area := f.String("area", "", "the area path, for example sorting/comparison")
+	name := f.String("name", "", "the display name; the default comes from the slug")
+	level := f.String("level", "core", "the level: intro, core, advanced or research")
+	if err := parse(f, args); err != nil {
+		return err
+	}
+	var slug string
+	switch f.NArg() {
+	case 1:
+		slug = f.Arg(0)
+	case 2:
+		*kind, slug = f.Arg(0), f.Arg(1)
+	default:
+		return usageError{"give a slug, or a kind and a slug"}
+	}
+	if !slugRE.MatchString(slug) || len(slug) > 60 {
+		return usageError{fmt.Sprintf("%q is not lowercase kebab-case of at most 60 characters", slug)}
+	}
+	if !node.IsKind(*kind) {
+		return usageError{fmt.Sprintf("%q is not a kind; use one of %s", *kind, strings.Join(node.Kinds, ", "))}
+	}
+	if *area == "" {
+		return usageError{"give the area with -area"}
+	}
+	c, err := load(*root)
+	if err != nil {
+		return err
+	}
+	if _, ok := c.AreaByID[*area]; !ok {
+		return usageError{fmt.Sprintf("the area %q is not in topics/areas.yaml", *area)}
+	}
+	if c.BySlug[slug] != nil {
+		return fmt.Errorf("the slug %q is used by %s", slug, c.BySlug[slug].Rel)
+	}
+	if c.Reserved[slug] || c.LangByID[slug] != nil || c.AreaByID[slug] != nil {
+		return fmt.Errorf("the slug %q is a reserved word, a language id or an area id", slug)
+	}
+	dir := filepath.Join(*root, "nodes", filepath.FromSlash(*area), slug)
+	if _, err := os.Stat(dir); err == nil {
+		return fmt.Errorf("%s exists", dir)
+	}
+	if *name == "" {
+		*name = strings.ToUpper(slug[:1]) + strings.ReplaceAll(slug[1:], "-", " ")
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "---\ntag: NEW-%s\nkind: %s\nslug: %s\nname: %s\narea: %s\nlevel: %s\nsummary: >-\n  Write one sentence that says what this is.\n---\n\n", slug, *kind, slug, *name, *area, *level)
+	for _, h := range check.Order[*kind] {
+		fmt.Fprintf(&b, "## %s\n\n", h)
+		if h == "The algorithm" {
+			b.WriteString("```pseudo id=main\nNAME(A)\nL1  ▷ write the first step\n```\n\n")
+		}
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	p := filepath.Join(dir, "node.md")
+	if err := os.WriteFile(p, []byte(strings.TrimRight(b.String(), "\n")+"\n"), 0o644); err != nil {
+		return err
+	}
+	fmt.Println(p)
+	return nil
+}
+
+// cmdCheck runs the audit rules. It exits with 1 only when a rule blocks.
+func cmdCheck(args []string) error {
+	f := newFlags("check", "[flags] [slug ...]")
+	root := f.String("root", ".", "the root of the content repository")
+	rule := f.String("rule", "", "run only this rule, for example T04")
+	changed := f.String("changed", "", "check only the nodes that changed since this git ref, for example origin/main")
+	main := f.Bool("main", false, "the run is on the main branch, so provisional ids block")
+	asJSON := f.Bool("json", false, "print the findings as JSON")
+	withViz := f.Bool("viz", false, "also build and check the scenes")
+	rules := f.Bool("rules", false, "print the rules and exit")
+	if err := parse(f, args); err != nil {
+		return err
+	}
+	if *rules {
+		var ids []string
+		for id := range check.Rules {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		for _, id := range ids {
+			fmt.Printf("%s  %s\n", id, check.Rules[id])
+		}
+		return nil
+	}
+	c, err := load(*root)
+	if err != nil {
+		return err
+	}
+	opt := check.Options{Rule: *rule, Main: *main}
+	if f.NArg() > 0 || *changed != "" {
+		opt.Only = map[string]bool{}
+		for _, s := range f.Args() {
+			if c.BySlug[s] == nil {
+				return usageError{fmt.Sprintf("no node has the slug %q", s)}
+			}
+			opt.Only[s] = true
+		}
+		if *changed != "" {
+			slugs, err := changedSlugs(c, *changed)
+			if err != nil {
+				return err
+			}
+			for _, s := range slugs {
+				opt.Only[s] = true
+			}
+			if len(opt.Only) == 0 {
+				fmt.Fprintln(os.Stderr, "no node changed")
+				return nil
+			}
+		}
+	}
+	findings := check.Run(c, opt)
+	if *withViz {
+		findings = append(findings, vizFindings(c, opt.Only)...)
+	}
+	blocks := 0
+	for _, x := range findings {
+		if x.Severity == check.Block {
+			blocks++
+		}
+	}
+	if *asJSON {
+		if findings == nil {
+			findings = []check.Finding{}
+		}
+		if err := printJSON(findings); err != nil {
+			return err
+		}
+	} else {
+		gha := os.Getenv("GITHUB_ACTIONS") == "true"
+		for _, x := range findings {
+			fmt.Println(x.String())
+			if gha {
+				level := "warning"
+				if x.Severity == check.Block {
+					level = "error"
+				}
+				loc := "file=" + x.Path
+				if x.Line > 0 {
+					loc += fmt.Sprintf(",line=%d", x.Line)
+				}
+				fmt.Printf("::%s %s,title=%s::%s\n", level, loc, x.Rule, x.Msg)
+			}
+		}
+		fmt.Fprintf(os.Stderr, "%d nodes, %d findings, %d block\n", countOnly(c, opt.Only), len(findings), blocks)
+	}
+	if blocks > 0 {
+		return errFindings
+	}
+	return nil
+}
+
+func countOnly(c *node.Corpus, only map[string]bool) int {
+	if len(only) == 0 {
+		return len(c.Nodes)
+	}
+	return len(only)
+}
+
+// changedSlugs gives the nodes with a file that changed between base and HEAD, or in the work tree.
+func changedSlugs(c *node.Corpus, base string) ([]string, error) {
+	var files []string
+	for _, a := range [][]string{{"diff", "--name-only", base + "...HEAD"}, {"diff", "--name-only", "HEAD"}, {"ls-files", "--others", "--exclude-standard"}} {
+		cmd := exec.Command("git", a...)
+		cmd.Dir = c.Root
+		out, err := cmd.Output()
+		if err != nil {
+			return nil, fmt.Errorf("git %s: %w", strings.Join(a, " "), err)
+		}
+		files = append(files, strings.Fields(string(out))...)
+	}
+	seen := map[string]bool{}
+	var slugs []string
+	for _, n := range c.Nodes {
+		prefix := n.Rel + "/"
+		for _, p := range files {
+			if strings.HasPrefix(filepath.ToSlash(p), prefix) && !seen[n.Slug] {
+				seen[n.Slug] = true
+				slugs = append(slugs, n.Slug)
+			}
+		}
+	}
+	return slugs, nil
+}
+
+func vizFindings(c *node.Corpus, only map[string]bool) []check.Finding {
+	var out []check.Finding
+	for _, n := range c.Nodes {
+		if n.Scene == "" || (len(only) > 0 && !only[n.Slug]) {
+			continue
+		}
+		r := checkScene(c, n)
+		for _, msg := range r.Fails {
+			out = append(out, check.Finding{Rule: "V00", Severity: check.Block, Path: n.Scene, Msg: msg})
+		}
+	}
+	return out
+}
+
+func checkScene(c *node.Corpus, n *node.Node) viz.Report {
+	js, err := viz.Build(filepath.Join(c.Root, n.Scene), false)
+	if err != nil {
+		return viz.Report{Slug: n.Slug, Fails: []string{"the scene does not build: " + err.Error()}}
+	}
+	var presets []viz.Preset
+	for _, p := range n.Presets {
+		presets = append(presets, viz.Preset{Name: p.Name, Input: p.Input})
+	}
+	ids, _ := check.PseudoIDs(n.Body)
+	return viz.Check(n.Slug, js, presets, ids["main"])
+}
+
+// cmdStatus prints the ladders of one node.
+func cmdStatus(args []string) error {
+	f := newFlags("status", "[flags] <slug>")
+	root := f.String("root", ".", "the root of the content repository")
+	results := f.String("results", "build/results", "the directory of the test results")
+	asJSON := f.Bool("json", false, "print the status as JSON")
+	if err := parse(f, args); err != nil {
+		return err
+	}
+	if f.NArg() != 1 {
+		return usageError{"give one slug"}
+	}
+	c, err := load(*root)
+	if err != nil {
+		return err
+	}
+	n := c.BySlug[f.Arg(0)]
+	if n == nil {
+		return usageError{fmt.Sprintf("no node has the slug %q", f.Arg(0))}
+	}
+	res, err := status.LoadResults(filepath.Join(*root, *results))
+	if err != nil {
+		return err
+	}
+	env := status.Env{Corpus: c, Results: res}
+	if n.Scene != "" {
+		r := checkScene(c, n)
+		if r.Skipped == "" {
+			env.VizChecked = map[string][]string{n.Slug: r.Fails}
+		}
+	}
+	st := status.Of(n, env)
+	if *asJSON {
+		return printJSON(st)
+	}
+	fmt.Printf("%s (%s, %s)\n\n", n.Name, n.Kind, n.Rel)
+	show := func(what string, r status.Rung) {
+		fmt.Printf("  %-14s %s  %s\n", what, r.Label, r.Name)
+		for _, s := range r.Next {
+			fmt.Printf("  %-14s    next: %s\n", "", s)
+		}
+	}
+	show("writing", st.W)
+	show("proof", st.H)
+	show("lean", st.L)
+	show("visual", st.V)
+	var ids []string
+	for id := range st.I {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		show("code "+id, st.I[id])
+	}
+	for _, id := range ids {
+		if t, ok := st.Tests[id]; ok {
+			state := "fail"
+			if t.Pass {
+				state = "pass"
+			}
+			fmt.Printf("  %-14s native tests %s in %d ms\n", "test "+id, state, t.Ms)
+		}
+	}
+	return nil
+}
+
+// cmdTest runs the native tests of the implementations and writes build/results/<lang>.json.
+func cmdTest(args []string) error {
+	f := newFlags("test", "[flags] [slug ...]")
+	root := f.String("root", ".", "the root of the content repository")
+	only := f.String("lang", "", "a comma list of languages to test; the default is all")
+	out := f.String("out", "build/results", "the directory for the results")
+	unsafe := f.Bool("unsafe-local", false, "run the tests on this machine; CI sets CI=true instead")
+	keep := f.Bool("keep", false, "keep the temporary directories")
+	if err := parse(f, args); err != nil {
+		return err
+	}
+	if !*unsafe && os.Getenv("CI") != "true" {
+		return usageError{"the tests run code from the repository; use a container or CI, or give -unsafe-local"}
+	}
+	c, err := load(*root)
+	if err != nil {
+		return err
+	}
+	var nodes []*node.Node
+	if f.NArg() == 0 {
+		nodes = c.Nodes
+	}
+	for _, s := range f.Args() {
+		n := c.BySlug[s]
+		if n == nil {
+			return usageError{fmt.Sprintf("no node has the slug %q", s)}
+		}
+		nodes = append(nodes, n)
+	}
+	want := map[string]bool{}
+	for _, l := range strings.Split(*only, ",") {
+		if l = strings.TrimSpace(l); l != "" {
+			if _, ok := lang.Recipes[l]; !ok {
+				return usageError{fmt.Sprintf("no test recipe for the language %q", l)}
+			}
+			want[l] = true
+		}
+	}
+	r := &lang.Runner{Keep: *keep, Log: func(format string, a ...any) { fmt.Fprintf(os.Stderr, format+"\n", a...) }}
+	byLang := map[string]*status.Results{}
+	failed := 0
+	for _, n := range nodes {
+		for _, im := range n.Impls {
+			if len(want) > 0 && !want[im.Lang] {
+				continue
+			}
+			rc, ok := lang.Recipes[im.Lang]
+			if !ok {
+				continue
+			}
+			if err := rc.Available(); err != nil {
+				var skip lang.Skip
+				if errors.As(err, &skip) {
+					fmt.Fprintf(os.Stderr, "skip %s/%s: %v\n", n.Slug, im.Lang, err)
+					continue
+				}
+				return err
+			}
+			res := byLang[im.Lang]
+			if res == nil {
+				res = &status.Results{Lang: im.Lang, Version: rc.ToolVersion()}
+				byLang[im.Lang] = res
+			}
+			t := r.Test(n, im)
+			state := "pass"
+			if !t.Pass {
+				state = "FAIL"
+				failed++
+			}
+			fmt.Printf("%-4s %s/%s (%d ms)\n", state, n.Slug, im.Lang, t.Ms)
+			if !t.Pass {
+				fmt.Println(indent(t.Output))
+			}
+			res.Tests = append(res.Tests, t)
+		}
+	}
+	dir := filepath.Join(*root, *out)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	for id, res := range byLang {
+		prev := filepath.Join(dir, id+".json")
+		if f.NArg() > 0 {
+			res.Tests = mergeTests(prev, res.Tests)
+		}
+		var buf bytes.Buffer
+		if err := writeJSON(&buf, res); err != nil {
+			return err
+		}
+		if err := os.WriteFile(prev, buf.Bytes(), 0o644); err != nil {
+			return err
+		}
+	}
+	if failed > 0 {
+		fmt.Fprintf(os.Stderr, "%d implementations failed\n", failed)
+		return errFindings
+	}
+	return nil
+}
+
+// mergeTests keeps the old results of the nodes that this run did not test.
+func mergeTests(path string, now []status.Test) []status.Test {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return now
+	}
+	var old status.Results
+	if readJSON(data, &old) != nil {
+		return now
+	}
+	seen := map[string]bool{}
+	for _, t := range now {
+		seen[t.Slug] = true
+	}
+	for _, t := range old.Tests {
+		if !seen[t.Slug] {
+			now = append(now, t)
+		}
+	}
+	sort.Slice(now, func(i, j int) bool { return now[i].Slug < now[j].Slug })
+	return now
+}
+
+func indent(s string) string {
+	s = strings.TrimRight(s, "\n")
+	if s == "" {
+		return ""
+	}
+	return "    " + strings.ReplaceAll(s, "\n", "\n    ")
+}
+
+// cmdViz bundles or checks the scenes.
+func cmdViz(args []string) error {
+	if len(args) == 0 {
+		return usageError{"use algo viz build <slug> or algo viz check [slug ...]"}
+	}
+	sub, args := args[0], args[1:]
+	switch sub {
+	case "build":
+		f := newFlags("viz build", "[flags] <slug>")
+		root := f.String("root", ".", "the root of the content repository")
+		out := f.String("o", "", "the output file; the default is standard output")
+		minify := f.Bool("minify", false, "minify the bundle")
+		if err := parse(f, args); err != nil {
+			return err
+		}
+		if f.NArg() != 1 {
+			return usageError{"give one slug"}
+		}
+		c, err := load(*root)
+		if err != nil {
+			return err
+		}
+		n := c.BySlug[f.Arg(0)]
+		if n == nil || n.Scene == "" {
+			return usageError{fmt.Sprintf("no node with the slug %q has a scene", f.Arg(0))}
+		}
+		js, err := viz.Build(filepath.Join(c.Root, n.Scene), *minify)
+		if err != nil {
+			return err
+		}
+		if *out == "" {
+			_, err = os.Stdout.Write(js)
+			return err
+		}
+		return os.WriteFile(*out, js, 0o644)
+	case "check":
+		f := newFlags("viz check", "[flags] [slug ...]")
+		root := f.String("root", ".", "the root of the content repository")
+		asJSON := f.Bool("json", false, "print the reports as JSON")
+		if err := parse(f, args); err != nil {
+			return err
+		}
+		c, err := load(*root)
+		if err != nil {
+			return err
+		}
+		only := map[string]bool{}
+		for _, s := range f.Args() {
+			only[s] = true
+		}
+		var reports []viz.Report
+		failed := 0
+		for _, n := range c.Nodes {
+			if n.Scene == "" || (len(only) > 0 && !only[n.Slug]) {
+				continue
+			}
+			r := checkScene(c, n)
+			reports = append(reports, r)
+			if len(r.Fails) > 0 {
+				failed++
+			}
+		}
+		if *asJSON {
+			if reports == nil {
+				reports = []viz.Report{}
+			}
+			if err := printJSON(reports); err != nil {
+				return err
+			}
+		} else {
+			for _, r := range reports {
+				switch {
+				case r.Skipped != "":
+					fmt.Printf("skip %s: %s\n", r.Slug, r.Skipped)
+				case len(r.Fails) == 0:
+					fmt.Printf("pass %s: %d presets, %d lines reached\n", r.Slug, len(r.Steps), len(r.Lines))
+				default:
+					fmt.Printf("FAIL %s\n", r.Slug)
+					for _, m := range r.Fails {
+						fmt.Println("    " + m)
+					}
+				}
+			}
+		}
+		if failed > 0 {
+			return errFindings
+		}
+		return nil
+	}
+	return usageError{fmt.Sprintf("unknown subcommand %q; use build or check", sub)}
+}
+
+// cmdSite builds, serves or checks the static site.
+func cmdSite(args []string) error {
+	if len(args) == 0 {
+		return usageError{"use algo site build, algo site serve or algo site check"}
+	}
+	sub, args := args[0], args[1:]
+	f := newFlags("site "+sub, "[flags]")
+	root := f.String("root", ".", "the root of the content repository")
+	out := f.String("out", "build/site", "the output directory")
+	base := f.String("base", "https://algorithm.tamnd.com", "the base URL")
+	results := f.String("results", "build/results", "the directory of the test results")
+	spec := f.String("spec", "", "a directory of the specification to publish at /spec/")
+	commit := f.String("commit", "", "the commit of the content; the default comes from git")
+	minify := f.Bool("minify", false, "minify the scenes")
+	addr := f.String("addr", "localhost:8150", "the address for serve")
+	if err := parse(f, args); err != nil {
+		return err
+	}
+	opt := site.Options{
+		Out:      filepath.Join(*root, *out),
+		BaseURL:  strings.TrimRight(*base, "/"),
+		Results:  filepath.Join(*root, *results),
+		SpecDir:  *spec,
+		Version:  ver(),
+		Commit:   *commit,
+		Repo:     "https://github.com/tamnd/algorithm",
+		AgentURL: "https://github.com/tamnd/algorithm-agent",
+		Minify:   *minify,
+		Log:      func(format string, a ...any) { fmt.Fprintf(os.Stderr, "warn: "+format+"\n", a...) },
+	}
+	if filepath.IsAbs(*out) {
+		opt.Out = *out
+	}
+	if filepath.IsAbs(*results) {
+		opt.Results = *results
+	}
+	if opt.Commit == "" {
+		cmd := exec.Command("git", "rev-parse", "HEAD")
+		cmd.Dir = *root
+		if b, err := cmd.Output(); err == nil {
+			opt.Commit = strings.TrimSpace(string(b))
+		}
+	}
+	build := func() error {
+		start := time.Now()
+		c, err := load(*root)
+		if err != nil {
+			return err
+		}
+		rep, err := site.Build(c, opt)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "built %d pages, %d files, %.1f MB in %s\n", rep.Pages, rep.Files, float64(rep.Bytes)/1e6, time.Since(start).Round(time.Millisecond))
+		for _, m := range rep.MathErrors {
+			fmt.Fprintln(os.Stderr, "math: "+m)
+		}
+		return nil
+	}
+	switch sub {
+	case "build":
+		return build()
+	case "check":
+		if err := build(); err != nil {
+			return err
+		}
+		bad, err := checkLinks(opt.Out)
+		if err != nil {
+			return err
+		}
+		for _, b := range bad {
+			fmt.Println(b)
+		}
+		if len(bad) > 0 {
+			fmt.Fprintf(os.Stderr, "%d broken links\n", len(bad))
+			return errFindings
+		}
+		return nil
+	case "serve":
+		opt.BaseURL = "http://" + *addr
+		if err := build(); err != nil {
+			return err
+		}
+		go watch(*root, build)
+		fmt.Fprintf(os.Stderr, "serving %s at http://%s\n", opt.Out, *addr)
+		srv := &http.Server{Addr: *addr, Handler: serveDir(opt.Out), ReadHeaderTimeout: 10 * time.Second}
+		return srv.ListenAndServe()
+	}
+	return usageError{fmt.Sprintf("unknown subcommand %q; use build, serve or check", sub)}
+}
+
+// serveDir serves the site like Cloudflare Pages: /a/ maps to a/index.html, and a missing page gets 404.html.
+func serveDir(dir string) http.Handler {
+	files := http.FileServer(http.Dir(dir))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := filepath.Join(dir, filepath.FromSlash(filepath.Clean("/"+r.URL.Path)))
+		if st, err := os.Stat(p); err != nil || (st.IsDir() && !exists(filepath.Join(p, "index.html"))) {
+			if data, err := os.ReadFile(filepath.Join(dir, "404.html")); err == nil {
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write(data)
+				return
+			}
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		files.ServeHTTP(w, r)
+	})
+}
+
+func exists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}
+
+// watch rebuilds the site when a file under root changes. It polls, so it needs no extra package.
+func watch(root string, build func() error) {
+	last := stamp(root)
+	for {
+		time.Sleep(700 * time.Millisecond)
+		now := stamp(root)
+		if now.Equal(last) {
+			continue
+		}
+		last = now
+		if err := build(); err != nil {
+			fmt.Fprintln(os.Stderr, "build: "+err.Error())
+		}
+	}
+}
+
+func stamp(root string) time.Time {
+	var t time.Time
+	for _, d := range []string{"nodes", "topics", "registers", "reviews"} {
+		_ = filepath.WalkDir(filepath.Join(root, d), func(_ string, e fs.DirEntry, err error) error {
+			if err != nil || e.IsDir() {
+				return nil
+			}
+			if info, err := e.Info(); err == nil && info.ModTime().After(t) {
+				t = info.ModTime()
+			}
+			return nil
+		})
+	}
+	return t
+}
+
+var hrefRE = regexp.MustCompile(`(?:href|src)="(/[^"#?]*)`)
+
+// checkLinks finds the internal links of the built site that point at no file.
+func checkLinks(dir string) ([]string, error) {
+	var bad []string
+	seen := map[string]bool{}
+	err := filepath.WalkDir(dir, func(p string, e fs.DirEntry, err error) error {
+		if err != nil || e.IsDir() || !strings.HasSuffix(p, ".html") {
+			return err
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		rel, _ := filepath.Rel(dir, p)
+		for _, m := range hrefRE.FindAllSubmatch(data, -1) {
+			u := string(m[1])
+			if strings.HasPrefix(u, "//") {
+				continue
+			}
+			key := rel + " " + u
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			t := filepath.Join(dir, filepath.FromSlash(u))
+			if strings.HasSuffix(u, "/") {
+				t = filepath.Join(t, "index.html")
+			}
+			if !exists(t) && !exists(t+".html") {
+				bad = append(bad, fmt.Sprintf("%s: the link %s points at no file", filepath.ToSlash(rel), u))
+			}
+		}
+		return nil
+	})
+	sort.Strings(bad)
+	return bad, err
+}

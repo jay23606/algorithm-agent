@@ -1,0 +1,71 @@
+# algorithm-agent
+
+[![CI](https://github.com/tamnd/algorithm-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/tamnd/algorithm-agent/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/tamnd/algorithm-agent/badge)](https://scorecard.dev/viewer/?uri=github.com/tamnd/algorithm-agent)
+[![Go Reference](https://pkg.go.dev/badge/github.com/tamnd/algorithm-agent.svg)](https://pkg.go.dev/github.com/tamnd/algorithm-agent)
+
+This repository holds `algo`, the toolchain of [algorithm.tamnd.com](https://algorithm.tamnd.com). The content is in [tamnd/algorithm](https://github.com/tamnd/algorithm).
+
+`algo` reads the content tree, checks it against the specification, runs the tests of the implementations, bundles the visualizations and renders the site.
+
+## Install
+
+You need Go 1.27 or later.
+
+```sh
+go install github.com/tamnd/algorithm-agent/cmd/algo@latest
+```
+
+You can also download a binary from the [releases](https://github.com/tamnd/algorithm-agent/releases). Each binary has a build provenance attestation. To verify a binary, run `gh attestation verify algo_linux_amd64.tar.gz -R tamnd/algorithm-agent`.
+
+## Use
+
+Run these commands in a clone of tamnd/algorithm.
+
+| Command | What it does |
+| --- | --- |
+| `algo new algorithm heap-sort -area sorting/comparison-sorts` | Makes a node directory with the sections of its kind. |
+| `algo check` | Runs the audit rules. Add `-changed origin/main` to check only the nodes that a branch changes. |
+| `algo status binary-search` | Shows the ladders of a node and what the next level needs. |
+| `algo test -unsafe-local binary-search` | Runs the native tests of the implementations. |
+| `algo viz check` | Builds each scene and runs each preset two times. |
+| `algo site serve` | Renders the site and serves it at http://localhost:8150. It renders again when a file changes. |
+| `algo site check` | Renders the site and checks each internal link. |
+
+`algo help` shows all commands. Commands that are planned but not built yet exit with code 3 and name their milestone.
+
+The exit codes are: 0 for success, 1 when a check finds a problem, 2 for a usage error and 3 for a planned command.
+
+## Safety of `algo test`
+
+`algo test` compiles and runs code from the content tree. On your computer it runs only with the flag `-unsafe-local`. Use it only on code that you have read. In CI, each language runs in its own job with no secrets.
+
+## Layout
+
+| Directory | Contents |
+| --- | --- |
+| `cmd/algo` | The command. |
+| `node` | Reads the content tree. |
+| `check` | The audit rules of spec part 13. |
+| `status` | The ladders of a node. |
+| `lang` | Runs the native tests for each language. |
+| `viz` | Bundles the scenes with esbuild and checks them in a JavaScript runtime. |
+| `markup` | Markdown, pseudocode and math. |
+| `katex` | Renders TeX to HTML on the server. |
+| `site` | The templates, assets and pages of the site. |
+| `spec` | The specification. The site publishes it at [/spec/](https://algorithm.tamnd.com/spec/). |
+| `testdata/corpus` | A small content tree for the tests. |
+
+## Develop
+
+```sh
+make test     # go vet and go test
+make lint     # golangci-lint
+make site     # render testdata/corpus into build/site
+```
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before you open a pull request. To report a security problem, read [SECURITY.md](SECURITY.md).
+
+## Licence
+
+The code is under the [Apache License 2.0](LICENSE). The scene package `viz/packages/core` is under the MIT licence, so scenes in the content repository can use it. The parts from other projects are listed in [THIRD_PARTY.md](THIRD_PARTY.md).
