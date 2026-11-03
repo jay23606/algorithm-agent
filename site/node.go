@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -36,6 +37,7 @@ type NodePage struct {
 	Sources  []SourceView
 	Edit     string
 	History  string
+	Report   string
 	Tests    string // the summary line of the native tests
 }
 
@@ -252,6 +254,7 @@ func (b *builder) nodePage(n *node.Node) (*NodePage, error) {
 	p.Status = b.status[n.Slug]
 	p.Edit = fmt.Sprintf("%s/edit/main/%s/node.md", b.opt.Repo, filepath.ToSlash(n.Rel))
 	p.History = fmt.Sprintf("%s/commits/main/%s", b.opt.Repo, filepath.ToSlash(n.Rel))
+	p.Report = b.opt.Repo + "/issues/new?" + url.Values{"template": {"error.yml"}, "title": {"Error on " + n.Name}, "url": {b.opt.BaseURL + "/" + n.Slug + "/"}}.Encode()
 	p.Prereqs = b.links(n.Prereqs)
 	for _, l := range b.c.Leads(n.Slug) {
 		p.Leads = append(p.Leads, b.link(l.Slug))

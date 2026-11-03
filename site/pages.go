@@ -492,7 +492,7 @@ func (b *builder) pages() error {
 	}
 	nf := DocPage{Base: b.base("Page not found", "This page does not exist.", "/404/"), Heading: "Page not found", Lead: "This page does not exist yet. Maybe nobody wrote it, or the address has a mistake."}
 	nf.NoIndex = true
-	nf.Body = template.HTML(`<p>Use the search, or go to the <a href="/areas/">areas</a>. If you think that the page must exist, <a href="` + b.opt.Repo + `/issues/new?labels=type%3Acontent">open an issue</a>.</p>`)
+	nf.Body = template.HTML(`<p>Use the search, or go to the <a href="/areas/">areas</a>. If you think that the page must exist, <a href="` + b.opt.Repo + `/issues/new?template=node.yml">open an issue</a>.</p>`)
 	if err := b.page("doc", "/404/", nf); err != nil {
 		return err
 	}
